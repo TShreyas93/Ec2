@@ -1,0 +1,146 @@
+name: Create EC2 from ec2_values.json
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  create-ec2:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install jq and AWS CLI v2
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq unzip
+          # Install AWS CLI v2 (if not already available)
+          if ! command -v aws >/dev/null 2>&1; then
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip awscliv2.zip
+            sudo ./aws/install
+          fi
+          aws --version
+          jq --version
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Validate ec2_values.json exists
+        run: |
+          if [ ! -f ec2_values.json ]; then
+            echo "ec2_values.json not found at repo root. Exiting."
+            exit 1
+          fi
+          jq . ec2_values.json
+
+      - name: Create EC2 instance (reads ec2_values.json)
+        id: create_ec2
+        run: |
+          set -eo pipefail
+
+          # parse fields
+          IMAGE_ID=$(jq -r '.image_id' ec2_values.json)
+          INSTANCE_TYPE=$(jq -r '.instance_type' ec2_values.json)
+          KEY_NAME=$(jq -r '.key_name // empty' ec2_values.json)
+          SUBNET_ID=$(jq -r '.subnet_id // empty' ec2_values.json)
+          TAG_NAME=$(jq -r '.tag_name // "github-created-ec2"' ec2_values.json)
+          ASSOC_PUBLIC=$(jq -r '.associate_public_ip // true' ec2_values.json)
+          USER_DATA_RAW=$(jq -r '.user_data // empty' ec2_values.json)
+
+          if [ -z "$IMAGE_ID" ] || [ -z "$INSTANCE_TYPE" ]; then
+            echo "image_id and instance_type are required in ec2_values.json"
+            exit 1
+          fi
+
+          # security group ids -> join with space
+          SG_IDS=$(jq -r '.security_group_ids // [] | join(" ")' ec2_values.json)
+
+          # prepare user-data base64 if provided
+          if [ -n "$USER_DATA_RAW" ] && [ "$USER_DATA_RAW" != "null" ]; then
+            # write to temp file and base64-encode (AWS CLI accepts plain text too, but this ensures safety)
+            printf "%s" "$USER_DATA_RAW" > .tmp_user_data.sh
+            USER_DATA_ARG="file://.tmp_user_data.sh"
+          else
+            USER_DATA_ARG=""
+          fi
+
+          # Build security group arg only if provided
+          SG_ARG=()
+          if [ -n "$SG_IDS" ]; then
+            # convert whitespace-separated into separate args
+            for sg in $SG_IDS; do
+              SG_ARG+=(--security-group-ids "$sg")
+            done
+          fi
+
+          # Build subnet arg if provided
+          SUBNET_ARG=()
+          if [ -n "$SUBNET_ID" ]; then
+            SUBNET_ARG=(--subnet-id "$SUBNET_ID")
+          fi
+
+          # Run instance
+          echo "Launching EC2 instance with:"
+          echo "  AMI: $IMAGE_ID"
+          echo "  Type: $INSTANCE_TYPE"
+          echo "  Key: ${KEY_NAME:-(none)}"
+          echo "  SGs: ${SG_IDS:-(none)}"
+          echo "  Subnet: ${SUBNET_ID:-(none)}"
+          echo "  Tag: $TAG_NAME"
+
+          RUN_CMD=(aws ec2 run-instances --image-id "$IMAGE_ID" --count 1 --instance-type "$INSTANCE_TYPE")
+          if [ -n "$KEY_NAME" ]; then
+            RUN_CMD+=(--key-name "$KEY_NAME")
+          fi
+          # attach security groups
+          if [ ${#SG_ARG[@]} -gt 0 ]; then
+            RUN_CMD+=("${SG_ARG[@]}")
+          fi
+          if [ ${#SUBNET_ARG[@]} -gt 0 ]; then
+            RUN_CMD+=("${SUBNET_ARG[@]}")
+          fi
+          if [ -n "$USER_DATA_ARG" ]; then
+            RUN_CMD+=(--user-data "$USER_DATA_RAW")
+          fi
+
+          # Add tag via TagSpecifications
+          RUN_CMD+=(--tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$TAG_NAME}]")
+
+          # Execute
+          echo "Running: ${RUN_CMD[*]}"
+          INSTANCE_JSON="$("${RUN_CMD[@]}")"
+          echo "$INSTANCE_JSON" | jq .
+
+          INSTANCE_ID=$(echo "$INSTANCE_JSON" | jq -r '.Instances[0].InstanceId')
+          echo "Launched Instance ID: $INSTANCE_ID"
+
+          # wait until running
+          aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+          echo "Instance $INSTANCE_ID is running."
+
+          # fetch public/private IPs
+          DESCRIBE=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID")
+          PUBLIC_IP=$(echo "$DESCRIBE" | jq -r '.Reservations[0].Instances[0].PublicIpAddress // empty')
+          PRIVATE_IP=$(echo "$DESCRIBE" | jq -r '.Reservations[0].Instances[0].PrivateIpAddress // empty')
+
+          echo "Public IP: ${PUBLIC_IP:-(none)}"
+          echo "Private IP: ${PRIVATE_IP:-(none)}"
+
+          # expose outputs to subsequent steps
+          echo "::set-output name=instance_id::$INSTANCE_ID"
+          echo "::set-output name=public_ip::${PUBLIC_IP}"
+          echo "::set-output name=private_ip::${PRIVATE_IP}"
+
+      - name: Show created instance info
+        run: |
+          echo "Instance: ${{ steps.create_ec2.outputs.instance_id }}"
+          echo "Public IP: ${{ steps.create_ec2.outputs.public_ip }}"
+          echo "Private IP: ${{ steps.create_ec2.outputs.private_ip }}"
