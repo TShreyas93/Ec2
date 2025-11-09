@@ -1,8 +1,8 @@
 {
   "image_id": "ami-0157af9aea2eef346",
   "instance_type": "t3.micro",
-  "security_group_ids": ["sg-01234567","sg-89abcdef"],
-  "subnet_id": "subnet-01234567",
+  "security_group_ids": ["sg-00e9ab781eb86d17d"],
+  "subnet_id": "subnet-072c2d7862bdeac01",
   "tag_name": "my-github-created-instance",
   "associate_public_ip": true,
   "user_data": "#!/bin/bash\necho Hello from GitHub Actions > /home/ec2-user/welcome.txt"
